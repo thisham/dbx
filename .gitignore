@@ -1,0 +1,8 @@
+.ctx/
+node_modules/
+web/dist/
+/dbx
+.DS_Store
+
+/test-results/
+/playwright-report/

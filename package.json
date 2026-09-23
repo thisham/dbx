@@ -1,0 +1,31 @@
+{
+  "name": "dbdiag",
+  "version": "1.0.0",
+  "description": "Database schema code and visual editor",
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "test": "node --test web/src/schema.test.js",
+    "start": "go run .",
+    "test:e2e": "npm run build && playwright test"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/thisham/dbx.git"
+  },
+  "keywords": [],
+  "author": "hamdan <59078748+thisham@users.noreply.github.com>",
+  "license": "ISC",
+  "type": "module",
+  "bugs": {
+    "url": "https://github.com/thisham/dbx/issues"
+  },
+  "homepage": "https://github.com/thisham/dbx#readme",
+  "dependencies": {
+    "@dbml/core": "^10.2.0"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.63.0",
+    "esbuild": "^0.28.2"
+  },
+  "private": true
+}
