@@ -1,4 +1,6 @@
 import { Parser, ModelExporter } from '@dbml/core';
+import { normalizeViewTables, importSQL, exportSQL, isView, analyzeQuery } from './views.js';
+export { isView } from './views.js';
 
 export const SAMPLE = `// Commerce · a small schema to explore
 Table customers {
@@ -36,11 +38,12 @@ Ref: order_items.product_id > products.id
 `;
 
 export function parse(source, language = 'dbml', dialect = 'postgres') {
-  return new Parser().parse(source, language === 'dbml' ? 'dbmlv2' : dialect);
+  return new Parser().parse(language === 'dbml' ? normalizeViewTables(source) : importSQL(source,dialect), 'dbmlv2');
 }
 export function convert(source, from, to, dialect = 'postgres') {
   if (from === to) { parse(source, from, dialect); return source; }
-  return ModelExporter.export(parse(source, from, dialect), to === 'sql' ? dialect : 'dbml');
+  if (from === 'sql' && to === 'dbml') return importSQL(source,dialect);
+  return exportSQL(parse(source),dialect);
 }
 export function describe(database) {
   const model = database.normalize();
@@ -49,6 +52,7 @@ export function describe(database) {
       schema: model.schemas[t.schemaId].name,
       fields: t.fieldIds.map(id => model.fields[id]),
     })),
+    lineage: Object.values(model.depEdges).map(edge => ({...edge, dependency: model.deps[edge.depId]})),
     refs: Object.values(model.refs).map(r => ({...r, endpoints: r.endpointIds.map(id => ({...model.endpoints[id], tableId: model.fields[model.endpoints[id].fieldIds[0]].tableId}))})),
   };
 }
@@ -75,17 +79,25 @@ function removeRef(model, id) {
   delete model.refs[id];
 }
 function exportModel(model) {
-  const source = ModelExporter.export(model, 'dbml');
+  const clean = structuredClone(model);
+  clean.deps = {}; clean.depEdges = {};
+  for (const schema of Object.values(clean.schemas)) schema.depIds = [];
+  for (const field of Object.values(clean.fields)) field.depEdgeIds = [];
+  const source = ModelExporter.export(clean, 'dbml') + serializeDependencies(model);
   parse(source); // Validate before replacing the last valid schema.
   return source;
 }
 function assertSafeStructuralEdit(model, table) {
-  if (table.checkIds.length || table.recordIds.length || table.fieldIds.some(id => model.fields[id].checkIds.length || model.fields[id].depEdgeIds.length) || table.indexIds.some(id => model.indexes[id].columnIds.some(cid => model.indexColumns[cid].type !== 'column'))) {
-    throw new Error('This table has expressions, checks, records or dependencies. Change its structure in the code editor so those expressions can be updated together.');
+  const tables=Object.values(model.tables).map(t=>({...t,schema:model.schemas[t.schemaId].name,fields:t.fieldIds.map(id=>model.fields[id])}));
+  for (const view of tables.filter(isView)) {
+    if(view.id!==table.id && view.metadata.dbx_query && analyzeQuery(view.metadata.dbx_query,view.metadata.dbx_dialect,tables).dependencies.includes(table.id)) throw new Error('A SQL view depends on this table. Update its query and the source structure together in the code editor.');
+  }
+  if (table.checkIds.length || table.recordIds.length || table.fieldIds.some(id => model.fields[id].checkIds.length) || table.indexIds.some(id => model.indexes[id].columnIds.some(cid => model.indexColumns[cid].type !== 'column'))) {
+    throw new Error('This table has expression indexes, checks or records. Change its structure in the code editor so those expressions can be updated together.');
   }
 }
 export function saveTable(source, tableId, spec) {
-  const model = parse(source).normalize();
+  const model = editableModel(source);
   if (!spec.name.trim() || !spec.schema.trim() || !spec.fields.length) throw new Error('Enter a schema, table name, and at least one column.');
   // Parse user-entered types and names through the real DBML grammar.
   let probeName = '__dbx_edit_probe';
@@ -111,6 +123,16 @@ export function saveTable(source, tableId, spec) {
   if (previous && table.schemaId !== schema.id) model.schemas[table.schemaId].tableIds = model.schemas[table.schemaId].tableIds.filter(x => x !== id);
   if (!schema.tableIds.includes(id)) schema.tableIds.push(id);
   table.name = spec.name; table.schemaId = schema.id;
+  if(spec.kind !== undefined){
+    table.metadata ||= {};
+    if(spec.kind === 'view'){
+      table.metadata.dbx_kind='view'; table.metadata.dbx_query=spec.query || ''; table.metadata.dbx_dialect=spec.dialect || 'postgres';
+      if(spec.query) {
+        const tables=Object.values(model.tables).map(t=>({...t,schema:model.schemas[t.schemaId].name,fields:t.fieldIds.map(id=>model.fields[id])}));
+        analyzeQuery(spec.query,spec.dialect || 'postgres',tables,spec.fields.map(f=>f.name));
+      }
+    } else {delete table.metadata.dbx_kind; delete table.metadata.dbx_query; delete table.metadata.dbx_dialect;}
+  }
   model.tables[id] = table;
   table.fieldIds = spec.fields.map((input, i) => {
     const existing = oldFields.includes(input.id) ? model.fields[input.id] : null;
@@ -134,6 +156,7 @@ export function saveTable(source, tableId, spec) {
         delete model.indexes[iid]; table.indexIds = table.indexIds.filter(x => x !== iid);
       }
     }
+    for (const edge of Object.values(model.depEdges)) if (edge.upstreamFieldIds.includes(fid) || edge.downstreamFieldIds.includes(fid)) removeDependencyEdge(model, edge.id);
     delete model.fields[fid];
   }
   for (const endpoint of Object.values(model.endpoints)) {
@@ -143,6 +166,7 @@ export function saveTable(source, tableId, spec) {
     endpoint.schemaName = model.schemas[target.schemaId].name;
     endpoint.fieldNames = endpoint.fieldIds.map(fid => model.fields[fid].name);
   }
+  refreshDependencyEndpoints(model);
   return exportModel(model);
 }
 export function deleteTable(source, tableId) {
@@ -152,6 +176,7 @@ export function deleteTable(source, tableId) {
   for (const ref of Object.values(model.refs)) if (ref.endpointIds.some(eid => model.endpoints[eid].fieldIds.some(fid => table.fieldIds.includes(fid)))) removeRef(model, ref.id);
   for (const iid of table.indexIds) { model.indexes[iid].columnIds.forEach(cid => delete model.indexColumns[cid]); delete model.indexes[iid]; }
   for (const group of Object.values(model.tableGroups)) group.tableIds = group.tableIds.filter(id => id !== tableId);
+  for (const edge of Object.values(model.depEdges)) if (edge.upstreamTableId === tableId || edge.downstreamTableId === tableId) removeDependencyEdge(model, edge.id);
   table.fieldIds.forEach(fid => delete model.fields[fid]);
   model.schemas[table.schemaId].tableIds = model.schemas[table.schemaId].tableIds.filter(id => id !== tableId);
   delete model.tables[tableId];
@@ -172,4 +197,62 @@ export function deleteRelationship(source, id) {
   const model = parse(source).normalize();
   removeRef(model, id);
   return exportModel(model);
+}
+
+function editableModel(source) { return parse(source).normalize(); }
+function stringLiteral(value) { return "'" + String(value).replaceAll('\\', '\\\\').replaceAll("'", "\\'").replaceAll('\n', '\\n').replaceAll('\r', '\\r') + "'"; }
+function dependencyEndpoint(model, tableId, fieldIds) {
+  const t = model.tables[tableId];
+  if (!t) throw new Error('The dependency table no longer exists.');
+  const name = `${quote(model.schemas[t.schemaId].name)}.${quote(t.name)}`;
+  if (!fieldIds.length) return name;
+  const fields = fieldIds.map(id => quote(model.fields[id].name));
+  return name + '.' + (fields.length > 1 ? '(' + fields.join(', ') + ')' : fields[0]);
+}
+function serializeDependencies(model) {
+  return Object.values(model.deps).map(dep => {
+    const edges = dep.edgeIds.map(id => model.depEdges[id]).filter(Boolean);
+    if (!edges.length) return '';
+    const lines = edges.map(edge => `  ${dependencyEndpoint(model, edge.upstreamTableId, edge.upstreamFieldIds)} -> ${dependencyEndpoint(model, edge.downstreamTableId, edge.downstreamFieldIds)}`);
+    if (dep.note) lines.push('  note: ' + stringLiteral(dep.note));
+    for (const [key,value] of Object.entries(dep.metadata || {})) lines.push(`  ${key}: ${stringLiteral(value)}`);
+    return `\nDep${dep.name ? ' ' + quote(dep.name) : ''}${dep.color ? ' [color: ' + dep.color + ']' : ''} {\n${lines.join('\n')}\n}\n`;
+  }).join('');
+}
+function refreshDependencyEndpoints(model) {
+  for (const edge of Object.values(model.depEdges)) {
+    for (const side of ['upstream','downstream']) {
+      const table = model.tables[edge[side + 'TableId']];
+      edge[side] = {schemaName:model.schemas[table.schemaId].name,tableName:table.name,fieldNames:edge[side + 'FieldIds'].map(id => model.fields[id].name)};
+    }
+  }
+}
+function removeDependencyEdge(model, edgeId) {
+  const edge = model.depEdges[edgeId]; if (!edge) return;
+  const dep = model.deps[edge.depId];
+  dep.edgeIds = dep.edgeIds.filter(id => id !== edgeId);
+  for (const f of Object.values(model.fields)) f.depEdgeIds = f.depEdgeIds.filter(id => id !== edgeId);
+  delete model.depEdges[edgeId];
+  if (!dep.edgeIds.length) {
+    model.schemas[dep.schemaId].depIds = model.schemas[dep.schemaId].depIds.filter(id => id !== dep.id);
+    delete model.deps[dep.id];
+  }
+}
+export function saveDependency(source, edgeId, from, to, note = '') {
+  const model = editableModel(source);
+  if (from.tableId === to.tableId && JSON.stringify(from.fieldIds) === JSON.stringify(to.fieldIds)) throw new Error('Choose different upstream and downstream endpoints.');
+  if (edgeId != null) {
+    const edge = model.depEdges[edgeId];
+    if (!edge) throw new Error('Dependency not found.');
+    edge.upstreamTableId = from.tableId; edge.upstreamFieldIds = from.fieldIds;
+    edge.downstreamTableId = to.tableId; edge.downstreamFieldIds = to.fieldIds;
+    model.deps[edge.depId].note = note;
+    refreshDependencyEndpoints(model);
+    return exportModel(model);
+  }
+  const next = source + `\nDep {\n  ${dependencyEndpoint(model,from.tableId,from.fieldIds)} -> ${dependencyEndpoint(model,to.tableId,to.fieldIds)}${note ? '\n  note: ' + stringLiteral(note) : ''}\n}\n`;
+  parse(next); return next;
+}
+export function deleteDependency(source, edgeId) {
+  const model = editableModel(source); removeDependencyEdge(model, edgeId); return exportModel(model);
 }

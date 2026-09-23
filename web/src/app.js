@@ -1,12 +1,60 @@
-import { SAMPLE, parse, convert, describe, typeName, saveTable, deleteTable, addRelationship, deleteRelationship, errorText } from './schema.js';
+import { SAMPLE, parse, convert, describe, typeName, saveTable, deleteTable, addRelationship, deleteRelationship, saveDependency, deleteDependency, isView, errorText } from './schema.js';
 import './app.css';
+import { highlightInto } from './highlight.js';
 const $ = id => document.getElementById(id);
 let source = SAMPLE, language = 'dbml', dialect = 'postgres', filename = 'commerce', view, positions = {}, scale = 1, editingId = null;
 let history = [], future = [], dirty = false, drag = null;
 const MAX_SIZE = 2 * 1024 * 1024;
-function message(text, error = false) { $('message').textContent = text; $('message').classList.toggle('error', error); }
+let messageTimer, messageRemaining = 0, messageStarted = 0;
+function dismissMessage() {
+  clearTimeout(messageTimer); messageTimer = null;
+  if ($('toast').matches(':popover-open')) $('toast').hidePopover();
+}
+function resumeMessage() {
+  clearTimeout(messageTimer); messageTimer = null;
+  if (!$('toast').matches(':popover-open') || $('toast').matches(':hover') || $('toast').contains(document.activeElement)) return;
+  messageStarted = Date.now();
+  messageTimer = setTimeout(dismissMessage, messageRemaining);
+}
+function pauseMessage() {
+  if (messageTimer) messageRemaining = Math.max(0, messageRemaining - (Date.now() - messageStarted));
+  clearTimeout(messageTimer); messageTimer = null;
+}
+function message(text, error = false) {
+  clearTimeout(messageTimer); messageTimer = null;
+  $('message').textContent = text;
+  $('message').classList.toggle('error', error);
+  $('toast').classList.toggle('error-toast', error);
+  if (!$('toast').matches(':popover-open')) $('toast').showPopover();
+  messageRemaining = error ? 9000 : 5000;
+  resumeMessage();
+}
+$('dismiss-message').onclick = dismissMessage;
+$('toast').addEventListener('pointerenter', pauseMessage);
+$('toast').addEventListener('pointerleave', resumeMessage);
+$('toast').addEventListener('focusin', pauseMessage);
+$('toast').addEventListener('focusout', () => setTimeout(resumeMessage, 0));
+const fileMenu = $('file-menu');
+fileMenu.querySelector('.file-actions').addEventListener('click', event => {
+  if (event.target.closest('button')) { fileMenu.open = false; fileMenu.querySelector('summary').focus(); }
+});
+fileMenu.querySelector('summary').addEventListener('keydown', event => {
+  if (event.key === 'ArrowDown') { event.preventDefault(); fileMenu.open = true; fileMenu.querySelector('button').focus(); }
+});
+document.addEventListener('click', event => { if (!fileMenu.contains(event.target)) fileMenu.open = false; });
+document.addEventListener('keydown', event => {
+  if (event.key !== 'Escape') return;
+  dismissMessage();
+  if (fileMenu.open) { fileMenu.open = false; fileMenu.querySelector('summary').focus(); }
+  document.querySelectorAll('.icon-button').forEach(button => button.classList.add('tooltip-dismissed'));
+});
+document.querySelectorAll('.icon-button').forEach(button => {
+  for (const name of ['pointerenter', 'focus']) button.addEventListener(name, () => button.classList.remove('tooltip-dismissed'));
+});
 function attempt(fn) { try { return fn(); } catch (e) { message(errorText(e), true); return false; } }
-function setDirty(value) { dirty = value; $('code-state').textContent = value ? 'Unapplied changes' : 'Synced with diagram'; $('apply').disabled = !value; }
+function paintCode() { highlightInto($('highlight'), $('code').value, language); $('highlight').scrollTop = $('code').scrollTop; $('highlight').scrollLeft = $('code').scrollLeft; }
+$('code').addEventListener('scroll', () => { $('highlight').scrollTop = $('code').scrollTop; $('highlight').scrollLeft = $('code').scrollLeft; });
+function setDirty(value) { paintCode(); dirty = value; $('code-state').textContent = value ? 'Unapplied changes' : 'Synced with diagram'; $('apply').disabled = !value; }
 function ready() { if (dirty) { message('Apply your code changes before editing the diagram or switching formats.', true); return false; } return true; }
 function persist() {
   try { localStorage.setItem('dbx.workspace.v1', JSON.stringify({source, positions, filename, dialect})); }
@@ -36,14 +84,14 @@ function restore(item) { source = item.source; positions = item.positions; filen
 function element(tag, cls, text) { const el = document.createElement(tag); if (cls) el.className = cls; if (text != null) el.textContent = text; return el; }
 function render() {
   $('tables').replaceChildren();
-  $('counts').textContent = `${view.tables.length} tables · ${view.refs.length} relationships`;
+  $('counts').textContent = `${view.tables.filter(t => !isView(t)).length} tables${view.tables.some(isView) ? ' · ' + view.tables.filter(isView).length + ' views' : ''} · ${view.refs.length} relationships · ${view.lineage.length} dependencies`;
   $('empty').hidden = view.tables.length !== 0;
   view.tables.forEach((table, index) => {
     const position = positions[key(table)] ||= {x: 60 + index % 3 * 330, y: 60 + Math.floor(index / 3) * 320};
-    const card = element('article', 'table-card'); card.dataset.id = table.id;
+    const card = element('article', 'table-card' + (isView(table) ? ' view-card' : '')); card.dataset.id = table.id;
     card.style.left = position.x + 'px'; card.style.top = position.y + 'px';
     const head = element('button', 'table-head');
-    head.append(element('span', '', (table.schema === 'public' ? '' : table.schema + '.') + table.name), element('small', '', '⋮⋮'));
+    head.append(element('span', '', (table.schema === 'public' ? '' : table.schema + '.') + table.name), element('small', '', isView(table) ? 'VIEW ⋮⋮' : '⋮⋮'));
     head.title = 'Drag to move; click to edit ' + table.name;
     head.addEventListener('pointerdown', event => {
       if (event.button !== 0) return;
@@ -97,6 +145,7 @@ function drawEdges() {
     path.addEventListener('click', remove); path.addEventListener('keydown', e => { if (e.key === 'Enter' || e.key === ' ') {e.preventDefault(); remove();} });
     svg.append(path, svgElement('text',{x:ax+(right?9:-18),y:ay-8,class:'edge-label'},a.relation), svgElement('text',{x:bx+(right?-18:9),y:by-8,class:'edge-label'},b.relation));
   }
+  drawLineage(svg);
 }
 function zoom(value) { scale = Math.max(.3, Math.min(1.6, value)); $('canvas').style.zoom = scale; $('zoom').textContent = Math.round(scale * 100) + '%'; }
 function fit() {
@@ -117,6 +166,10 @@ function openTable(id = null) {
   if (!ready()) return;
   editingId = id;
   const table = view.tables.find(t => t.id === id);
+  $('table-kind').value = table && isView(table) ? 'view' : 'table';
+  $('view-query').value = table?.metadata?.dbx_query || ''; $('view-dialect').value=table?.metadata?.dbx_dialect || dialect;
+  $('view-query-section').hidden = $('table-kind').value !== 'view';
+  $('view-dialect').disabled = $('table-kind').value !== 'view';
   $('table-title').textContent = table ? 'Edit table' : 'New table'; $('table-name').value = table?.name || ''; $('table-schema').value = table?.schema || 'public';
   $('table-error').textContent = ''; $('delete-table').hidden = !table; $('column-list').replaceChildren();
   (table?.fields || [{name:'id',type:{type_name:'integer'},pk:true,not_null:true}]).forEach(columnRow);
@@ -125,7 +178,7 @@ function openTable(id = null) {
 $('table-form').onsubmit = event => {
   event.preventDefault();
   try {
-    const spec = {name:$('table-name').value.trim(),schema:$('table-schema').value.trim(),fields:[...$('column-list').children].map(row => {
+    const spec = {kind:$('table-kind').value,query:$('view-query').value.trim(),dialect:$('view-dialect').value,name:$('table-name').value.trim(),schema:$('table-schema').value.trim(),fields:[...$('column-list').children].map(row => {
       const f = {id: Number(row.dataset.id) || null}; row.querySelectorAll('input').forEach(input => f[input.dataset.prop] = input.type === 'checkbox' ? input.checked : input.value.trim()); return f;
     })};
     const nextPositions = structuredClone(positions), old = view.tables.find(t => t.id === editingId);
@@ -137,6 +190,7 @@ $('delete-table').onclick = () => {
   if (!confirm('Delete this table and its relationships? You can undo this change.')) return;
   if (attempt(() => commit(deleteTable(source, editingId), 'Table deleted.'))) $('table-dialog').close();
 };
+$('table-kind').onchange=()=>{$('view-query-section').hidden=$('table-kind').value!=='view';$('view-dialect').disabled=$('table-kind').value!=='view';};
 $('add-column').onclick = () => columnRow();
 $('add-table').onclick = () => openTable();
 $('add-ref').onclick = () => {
@@ -199,3 +253,46 @@ try {
   if (saved && typeof saved.source === 'string') { parse(saved.source); source = saved.source; positions = saved.positions || {}; filename = saved.filename || 'untitled'; dialect = ['postgres','mysql','mssql'].includes(saved.dialect) ? saved.dialect : 'postgres'; }
 } catch { message('The saved workspace could not be restored. Showing the example schema.', true); }
 $('dialect').value = dialect; view = describe(parse(source)); syncCode(); render(); requestAnimationFrame(fit);
+
+let editingDepId = null;
+function drawLineage(svg) {
+  const defs = svgElement('defs', {}), marker = svgElement('marker',{id:'lineage-arrow',viewBox:'0 0 10 10',refX:'10',refY:'5',markerWidth:'7',markerHeight:'7',orient:'auto-start-reverse'});
+  marker.append(svgElement('path',{d:'M 0 0 L 10 5 L 0 10 z',class:'lineage-arrow'})); defs.append(marker); svg.append(defs);
+  for (const edge of view.lineage) {
+    const from = view.tables.find(t=>t.id===edge.upstreamTableId), to = view.tables.find(t=>t.id===edge.downstreamTableId); if (!from || !to) continue;
+    const a=positions[key(from)], b=positions[key(to)], right=a.x<=b.x;
+    const x1=a.x+(right?246:0), x2=b.x+(right?0:246);
+    const y1=a.y+(edge.upstreamFieldIds.length ? 64+from.fields.findIndex(f=>f.id===edge.upstreamFieldIds[0])*34 : 25);
+    const y2=b.y+(edge.downstreamFieldIds.length ? 64+to.fields.findIndex(f=>f.id===edge.downstreamFieldIds[0])*34 : 25);
+    const bend=Math.max(65,Math.abs(x2-x1)/2);
+    const d=from.id===to.id ? `M ${a.x+246} ${y1} C ${a.x+335} ${y1-45}, ${a.x+335} ${y2+45}, ${a.x+246} ${y2}` : `M ${x1} ${y1} C ${x1+(right?bend:-bend)} ${y1}, ${x2+(right?-bend:bend)} ${y2}, ${x2} ${y2}`;
+    const path=svgElement('path',{d,class:'edge lineage','marker-end':'url(#lineage-arrow)',tabindex:'0',role:'button','aria-label':`Edit lineage ${from.name} to ${to.name}`});
+    if (/^#[\da-f]{3,8}$/i.test(edge.dependency.color || '')) path.style.stroke=edge.dependency.color;
+    path.append(svgElement('title',{},[edge.dependency.name,`${from.name} → ${to.name}`,edge.dependency.note].filter(Boolean).join('\n')));
+    path.onclick=()=>openDependency(edge.id); path.onkeydown=e=>{if(e.key==='Enter'||e.key===' '){e.preventDefault();openDependency(edge.id);}}; svg.append(path);
+  }
+}
+function openDependency(id=null) {
+  if (!ready()) return;
+  if (!view.tables.length) return message('Add tables before creating lineage.',true);
+  editingDepId=id; const edge=view.lineage.find(e=>e.id===id);
+  for (const side of ['from','to']) {
+    const select=$('dep-'+side); select.replaceChildren();
+    for (const table of view.tables) {
+      const tableOption=element('option','',`${table.schema}.${table.name} (whole table)`); tableOption.value=JSON.stringify({tableId:table.id,fieldIds:[]}); select.append(tableOption);
+      for (const field of table.fields) { const option=element('option','',`${table.schema}.${table.name}.${field.name}`);option.value=JSON.stringify({tableId:table.id,fieldIds:[field.id]});select.append(option); }
+    }
+    if (edge) {
+      const prefix=side==='from'?'upstream':'downstream', value=JSON.stringify({tableId:edge[prefix+'TableId'],fieldIds:edge[prefix+'FieldIds']});
+      if (![...select.options].some(o=>o.value===value)) {const option=element('option','',edge[prefix].tableName+'.('+edge[prefix].fieldNames.join(', ')+')');option.value=value;select.append(option);}
+      select.value=value;
+    }
+  }
+  if (!edge && view.tables.length>1) $('dep-to').value=JSON.stringify({tableId:view.tables[1].id,fieldIds:[]});
+  $('dep-title').textContent=edge?'Edit dependency':'New dependency';$('dep-note').value=edge?.dependency.note||'';
+  $('dep-details').textContent=edge ? [edge.dependency.name,...Object.entries(edge.dependency.metadata||{}).map(([k,v])=>`${k}: ${v}`)].filter(Boolean).join(' · ') : 'The arrow points from source data to the derived table or column.';
+  $('dep-error').textContent='';$('delete-dep').hidden=!edge;$('dep-dialog').showModal();
+}
+$('add-dep').onclick=()=>openDependency();
+$('dep-form').onsubmit=e=>{e.preventDefault();try{commit(saveDependency(source,editingDepId,JSON.parse($('dep-from').value),JSON.parse($('dep-to').value),$('dep-note').value),'Data lineage updated.');$('dep-dialog').close();}catch(error){$('dep-error').textContent=errorText(error);}};
+$('delete-dep').onclick=()=>{if(attempt(()=>commit(deleteDependency(source,editingDepId),'Dependency removed.'))) $('dep-dialog').close();};
